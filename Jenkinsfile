@@ -6,16 +6,19 @@ pipeline {
     buildDiscarder(logRotator(numToKeepStr: '20', artifactNumToKeepStr: '10'))
     disableConcurrentBuilds()
     timeout(time: 30, unit: 'MINUTES')
-    // Si tienes el plugin, descomenta:
+    skipDefaultCheckout(true)          // evita el checkout implícito de Jenkins
+    newContainerPerStage()             // contenedor limpio por etapa
+    // Si tienes el plugin AnsiColor, puedes activar colores:
     // wrap([$class: 'AnsiColorBuildWrapper', colorMapName: 'xterm'])
   }
 
   environment {
     CI = 'true'
+    // caches dentro del workspace (propiedad de Jenkins, no root)
     NPM_CONFIG_CACHE = "${WORKSPACE}/.npm"
     CYPRESS_CACHE_FOLDER = "${WORKSPACE}/.cache/Cypress"
     npm_config_progress = 'false'
-    npm_config_audit = 'false'
+    npm_config_audit    = 'false'
   }
 
   stages {
@@ -23,11 +26,27 @@ pipeline {
       steps { checkout scm }
     }
 
+    // Repara una vez si quedaron archivos del pasado con dueño root
+    stage('Fix workspace ownership (one-off)') {
+      steps {
+        sh '''
+          JUID=$(id -u)
+          JGID=$(id -g)
+          # ¿Hay algo que NO sea del usuario Jenkins?
+          if find "$WORKSPACE" -mindepth 1 \\( ! -user "$JUID" -o ! -group "$JGID" \\) | head -n1 | grep -q .; then
+            echo "[info] Corrigiendo ownership del workspace (solo si era necesario)…"
+            docker run --rm -u 0:0 -v "$WORKSPACE":"$WORKSPACE" -w "$WORKSPACE" alpine \
+              sh -lc "chown -R $JUID:$JGID ."
+          fi
+        '''
+      }
+    }
+
     stage('Pre-pull images (warm cache)') {
       steps {
         sh '''
-          docker pull node:22
-          docker pull cypress/included:13.11.0
+          docker pull -q node:22 || docker pull node:22
+          docker pull -q cypress/included:13.11.0 || docker pull cypress/included:13.11.0
         '''
       }
     }
@@ -36,7 +55,7 @@ pipeline {
       agent {
         docker {
           image 'node:22'
-          // Mismo workspace en el contenedor
+          // mismo workspace en el contenedor; Jenkins ya inyecta -u <jenkins>
           args "-v ${WORKSPACE}:${WORKSPACE} -w ${WORKSPACE}"
         }
       }
@@ -53,25 +72,24 @@ pipeline {
       agent {
         docker {
           image 'cypress/included:13.11.0'
-          // Desactiva ENTRYPOINT y usa mismo workspace y caches
-          args "--entrypoint='' -v ${WORKSPACE}:${WORKSPACE} -w ${WORKSPACE} -v ${WORKSPACE}/.npm:${WORKSPACE}/.npm -v ${WORKSPACE}/.cache:${WORKSPACE}/.cache"
+          // Anula ENTRYPOINT; usa el mismo workspace
+          args "--entrypoint='' -v ${WORKSPACE}:${WORKSPACE} -w ${WORKSPACE}"
         }
       }
       steps {
         withEnv(["HOME=${WORKSPACE}"]) {
-          // Si por cualquier razón no existe node_modules, reinstala rápido desde cache
-          sh '''
-            if [ ! -d node_modules ]; then
-              npm ci --prefer-offline --no-audit --unsafe-perm
-            fi
-          '''
-          sh 'npx cypress run --spec "cypress/e2e/**/*.feature"'
+          // si no hay node_modules (ej. workspace limpio), reinstala rápido
+          sh 'test -d node_modules || npm ci --prefer-offline --no-audit --unsafe-perm'
+          retry(2) {
+            sh 'npx cypress run --spec "cypress/e2e/**/*.feature"'
+          }
         }
       }
       post {
         always {
           archiveArtifacts artifacts: 'cypress/screenshots/**, cypress/videos/**', allowEmptyArchive: true
-          // junit allowEmptyResults: true, testResults: 'cypress/results/junit-*.xml'  // (si configuras JUnit)
+          // Si configuras reporter JUnit:
+          // junit allowEmptyResults: true, testResults: 'cypress/results/junit-*.xml'
         }
       }
     }
@@ -79,8 +97,9 @@ pipeline {
 
   post {
     always {
-      // Limpia, pero conserva caches para acelerar el próximo build
-      sh 'find "$WORKSPACE" -maxdepth 1 -mindepth 1 -not -name ".npm" -not -name ".cache" -exec rm -rf {} + || true'
+      echo 'Pipeline finalizado.'
+      // No limpiamos el workspace completo para conservar caches (.npm/.cache) y acelerar el próximo build.
+      // npm ci ya se encarga de reemplazar node_modules de forma reproducible.
     }
     failure {
       echo 'Build o tests fallaron — revisa consola y artefactos.'
