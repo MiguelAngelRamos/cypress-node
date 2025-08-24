@@ -34,13 +34,13 @@ When("voy al catálogo", () => {
 When("abro el detalle del primer producto del catálogo", () => {
   CatalogPage.firstProductViewBtn().click(); // Hace clic en el botón de ver del primer producto
   cy.location("pathname").should("include", "/product.html"); // Verifica que la URL contiene "/product.html"
-  ProductPage.detail().should("exist"); // Verifica que la sección de detalle del producto existe
+  ProductPage.getDetailSection().should("exist"); // Verifica que la sección de detalle del producto existe
 });
 
 // Producto → Carrito
 When("agrego el producto actual al carrito con cantidad {int}", (qty) => {
-  ProductPage.qtyInput().clear().type(String(qty)); // Limpia el campo de cantidad y escribe la nueva cantidad
-  ProductPage.addBtn().click(); // Hace clic en el botón de agregar al carrito
+  ProductPage.getQuantityInput().clear().type(String(qty)); // Limpia el campo de cantidad y escribe la nueva cantidad
+  ProductPage.getAddToCartButton().click(); // Hace clic en el botón de agregar al carrito
   cy.get(".alert.alert-success").should("exist"); // Verifica que aparece un mensaje de éxito
 });
 
