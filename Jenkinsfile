@@ -6,15 +6,11 @@ pipeline {
     buildDiscarder(logRotator(numToKeepStr: '20', artifactNumToKeepStr: '10'))
     disableConcurrentBuilds()
     timeout(time: 30, unit: 'MINUTES')
-    skipDefaultCheckout(true)          // evita el checkout implícito de Jenkins
-    newContainerPerStage()             // contenedor limpio por etapa
-    // Si tienes el plugin AnsiColor, puedes activar colores:
-    // wrap([$class: 'AnsiColorBuildWrapper', colorMapName: 'xterm'])
+    // newContainerPerStage()  // <- lo evitamos; usamos stash/unstash
   }
 
   environment {
     CI = 'true'
-    // caches dentro del workspace (propiedad de Jenkins, no root)
     NPM_CONFIG_CACHE = "${WORKSPACE}/.npm"
     CYPRESS_CACHE_FOLDER = "${WORKSPACE}/.cache/Cypress"
     npm_config_progress = 'false'
@@ -23,22 +19,10 @@ pipeline {
 
   stages {
     stage('Checkout') {
-      steps { checkout scm }
-    }
-
-    // Repara una vez si quedaron archivos del pasado con dueño root
-    stage('Fix workspace ownership (one-off)') {
       steps {
-        sh '''
-          JUID=$(id -u)
-          JGID=$(id -g)
-          # ¿Hay algo que NO sea del usuario Jenkins?
-          if find "$WORKSPACE" -mindepth 1 \\( ! -user "$JUID" -o ! -group "$JGID" \\) | head -n1 | grep -q .; then
-            echo "[info] Corrigiendo ownership del workspace (solo si era necesario)…"
-            docker run --rm -u 0:0 -v "$WORKSPACE":"$WORKSPACE" -w "$WORKSPACE" alpine \
-              sh -lc "chown -R $JUID:$JGID ."
-          fi
-        '''
+        checkout scm
+        // Guardamos TODO el repo para recuperarlo en cualquier workspace
+        stash name: 'src', includes: '**', useDefaultExcludes: false
       }
     }
 
@@ -55,16 +39,32 @@ pipeline {
       agent {
         docker {
           image 'node:22'
-          // mismo workspace en el contenedor; Jenkins ya inyecta -u <jenkins>
           args "-v ${WORKSPACE}:${WORKSPACE} -w ${WORKSPACE}"
         }
       }
       steps {
+        // Recuperamos el código en ESTE workspace (@2, @3, etc.)
+        unstash 'src'
+        sh 'echo "[debug] WORKSPACE=$WORKSPACE"'
+        sh 'ls -la | sed -n "1,120p"'
+
         withEnv(["HOME=${WORKSPACE}"]) {
           retry(2) {
-            sh 'npm ci --prefer-offline --no-audit --unsafe-perm'
+            sh '''
+              if [ -f package-lock.json ]; then
+                echo "[npm] package-lock.json encontrado → npm ci"
+                npm ci --prefer-offline --no-audit --unsafe-perm
+              else
+                echo "[npm] NO hay package-lock.json → npm install y generamos lock"
+                npm install --no-audit --no-fund
+                test -f package-lock.json || npm install --package-lock-only
+                echo "[npm] *** Sube package-lock.json al repo (rama actual) para builds reproducibles ***"
+              fi
+            '''
           }
         }
+        // Guardamos node_modules por si quieres reusarlo en la etapa de Cypress
+        stash name: 'deps', includes: 'node_modules/**, package-lock.json', allowEmpty: true
       }
     }
 
@@ -72,37 +72,38 @@ pipeline {
       agent {
         docker {
           image 'cypress/included:13.11.0'
-          // Anula ENTRYPOINT; usa el mismo workspace
           args "--entrypoint='' -v ${WORKSPACE}:${WORKSPACE} -w ${WORKSPACE}"
         }
       }
       steps {
+        // Traemos el código y, si existe, los deps
+        unstash 'src'
+        script { try { unstash 'deps' } catch (e) { echo "No hay stash de deps, instalaremos…" } }
+
         withEnv(["HOME=${WORKSPACE}"]) {
-          // si no hay node_modules (ej. workspace limpio), reinstala rápido
-          sh 'test -d node_modules || npm ci --prefer-offline --no-audit --unsafe-perm'
-          retry(2) {
-            sh 'npx cypress run --spec "cypress/e2e/**/*.feature"'
-          }
+          sh '''
+            if [ ! -d node_modules ]; then
+              if [ -f package-lock.json ]; then
+                npm ci --prefer-offline --no-audit --unsafe-perm
+              else
+                npm install --no-audit --no-fund
+              fi
+            fi
+
+            npx cypress run --spec "cypress/e2e/**/*.feature"
+          '''
         }
       }
       post {
         always {
           archiveArtifacts artifacts: 'cypress/screenshots/**, cypress/videos/**', allowEmptyArchive: true
-          // Si configuras reporter JUnit:
-          // junit allowEmptyResults: true, testResults: 'cypress/results/junit-*.xml'
         }
       }
     }
   }
 
   post {
-    always {
-      echo 'Pipeline finalizado.'
-      // No limpiamos el workspace completo para conservar caches (.npm/.cache) y acelerar el próximo build.
-      // npm ci ya se encarga de reemplazar node_modules de forma reproducible.
-    }
-    failure {
-      echo 'Build o tests fallaron — revisa consola y artefactos.'
-    }
+    always { echo 'Pipeline finalizado.' }
+    failure { echo 'Build o tests fallaron — revisa consola y artefactos.' }
   }
 }
