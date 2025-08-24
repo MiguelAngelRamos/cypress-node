@@ -28,11 +28,13 @@ pipeline {
     stage('Install dependencies') {
       // Run npm install inside a Node container to avoid polluting the Jenkins agent
       agent {
-        docker { image 'node:18' }
+        docker { image 'node:22' }
       }
       steps {
         // Use npm ci for reproducible installs; falls back to npm install if no lockfile.
-        sh 'npm ci'
+          withEnv(["HOME=${WORKSPACE}"]) {
+            sh 'npm ci --cache "$WORKSPACE/.npm" --prefer-offline --no-audit --unsafe-perm'
+          }
       }
     }
 
@@ -42,8 +44,9 @@ pipeline {
         script {
           // Use the cypress/included image matching the Cypress version in package.json.
           docker.image('cypress/included:13.11.0').inside('--user 0') {
-            // Reinstall to ensure node_modules are present inside the test container.
-            sh 'npm ci'
+              // Re-install inside the cypress container but make npm use the workspace cache
+              // to avoid permission problems and speed up installs.
+              sh 'npm ci --cache "$WORKSPACE/.npm" --prefer-offline --no-audit --unsafe-perm'
 
             // Run all feature specs. To run a single feature change the --spec argument.
             sh 'npx cypress run --spec "cypress/e2e/**/*.feature"'
