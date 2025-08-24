@@ -6,7 +6,7 @@ pipeline {
     buildDiscarder(logRotator(numToKeepStr: '20', artifactNumToKeepStr: '10'))
     disableConcurrentBuilds()
     timeout(time: 30, unit: 'MINUTES')
-    // newContainerPerStage()  // <- lo evitamos; usamos stash/unstash
+    skipDefaultCheckout(true)   // <-- CLAVE: sin checkout automático en cada node/etapa
   }
 
   environment {
@@ -21,8 +21,10 @@ pipeline {
     stage('Checkout') {
       steps {
         checkout scm
-        // Guardamos TODO el repo para recuperarlo en cualquier workspace
-        stash name: 'src', includes: '**', useDefaultExcludes: false
+        // Guardamos el código sin .git ni node_modules
+        stash name: 'src',
+              includes: '**/*',
+              excludes: '.git/**, **/.git/**, node_modules/**, .npm/**, .cache/**'
       }
     }
 
@@ -39,13 +41,17 @@ pipeline {
       agent {
         docker {
           image 'node:22'
+          // mismo workspace y usuario jenkins dentro del contenedor
           args "-v ${WORKSPACE}:${WORKSPACE} -w ${WORKSPACE}"
         }
       }
       steps {
-        // Recuperamos el código en ESTE workspace (@2, @3, etc.)
+        // Limpia el workspace de la etapa pero conserva caches
+        sh 'find "$WORKSPACE" -mindepth 1 -maxdepth 1 -not -name ".npm" -not -name ".cache" -exec rm -rf {} + || true'
+
+        // Trae el código *sin* .git
         unstash 'src'
-        sh 'echo "[debug] WORKSPACE=$WORKSPACE"'
+
         sh 'ls -la | sed -n "1,120p"'
 
         withEnv(["HOME=${WORKSPACE}"]) {
@@ -55,15 +61,14 @@ pipeline {
                 echo "[npm] package-lock.json encontrado → npm ci"
                 npm ci --prefer-offline --no-audit --unsafe-perm
               else
-                echo "[npm] NO hay package-lock.json → npm install y generamos lock"
+                echo "[npm] NO hay package-lock.json → npm install"
                 npm install --no-audit --no-fund
-                test -f package-lock.json || npm install --package-lock-only
-                echo "[npm] *** Sube package-lock.json al repo (rama actual) para builds reproducibles ***"
               fi
             '''
           }
         }
-        // Guardamos node_modules por si quieres reusarlo en la etapa de Cypress
+
+        // Por si quieres reusar deps en la siguiente etapa
         stash name: 'deps', includes: 'node_modules/**, package-lock.json', allowEmpty: true
       }
     }
@@ -76,7 +81,8 @@ pipeline {
         }
       }
       steps {
-        // Traemos el código y, si existe, los deps
+        // Mismo patrón: limpiar suave + traer código y deps
+        sh 'find "$WORKSPACE" -mindepth 1 -maxdepth 1 -not -name ".npm" -not -name ".cache" -exec rm -rf {} + || true'
         unstash 'src'
         script { try { unstash 'deps' } catch (e) { echo "No hay stash de deps, instalaremos…" } }
 
@@ -103,7 +109,11 @@ pipeline {
   }
 
   post {
-    always { echo 'Pipeline finalizado.' }
+    always {
+      echo 'Pipeline finalizado.'
+      // Limpia, pero conserva caches para acelerar el próximo build
+      sh 'find "$WORKSPACE" -maxdepth 1 -mindepth 1 -not -name ".npm" -not -name ".cache" -exec rm -rf {} + || true'
+    }
     failure { echo 'Build o tests fallaron — revisa consola y artefactos.' }
   }
 }
